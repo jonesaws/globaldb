@@ -1,0 +1,502 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  PrimaryRegion:
+    Description: Is this a Primary region?
+    Type: String
+    Default: 'Yes'
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+  #KMSKeyARN:
+  #  Description: KMS Key ARN (only supplied for non primary regions)
+  #  Type: String
+  GlobalClusterIdentifier:
+    Description: Identifier used for global database cluster
+    Type: String
+    AllowedPattern: '^[a-zA-Z]{1}(?:-?[a-zA-Z0-9]){0,62}$'
+  VpcId:
+    Description: The VPC id for the Aurora Cluster
+    Type: AWS::EC2::VPC::Id
+  DatabaseSubnets:
+    Description: List of Subnets for Aurora
+    Type: List<AWS::EC2::Subnet::Id>
+  InstanceSubnet:
+    Description: Subnet for the EC2 Instance
+    Type: AWS::EC2::Subnet::Id
+  NotificationList:
+    Type: String
+    Description: The Email notification list is used to configure a SNS topic for sending cloudwatch alarm and RDS Event notifications
+    AllowedPattern: '^(([^<>()\[\]\\.,;:\s@"]+(\.[^<>()\[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$'
+    ConstraintDescription: provide a valid email address.
+  InstanceAmiId:
+    Type : 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+Conditions:
+  IsPrimaryRegion: !Equals 
+    - !Ref PrimaryRegion
+    - 'Yes'
+Resources:
+  DBNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+      - Endpoint: !Ref NotificationList
+        Protocol: email
+  AppSubnetGroup: 
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Limited SG for App
+      VpcId: !Ref VpcId
+  MonitoringIAMRole: 
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "monitoring.rds.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+  InstanceIAMRole: 
+    Type: AWS::IAM::Role
+    Condition: IsPrimaryRegion
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "ec2.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: allowSSMParameterRetrieval
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "ssm:DescribeParameters"
+                  - "ssm:GetParameters"
+                Resource: "*"
+        - PolicyName: allowXrayTelemetrySubmission
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                  - xray:GetSamplingStatisticSummaries
+                Resource: "*"
+        - PolicyName: allowS3ObjectRetrieval
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource: "arn:aws:s3:::globaldb-demo-assets/*"
+        - PolicyName: allowS3BucketList
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "s3:ListBucket"
+                Resource: "arn:aws:s3:::globaldb-demo-assets"
+        - PolicyName: allowDbCredentialRetrieval
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "secretsmanager:GetResourcePolicy"
+                  - "secretsmanager:GetSecretValue"
+                  - "secretsmanager:DescribeSecret"
+                  - "secretsmanager:ListSecretVersionIds"
+                Resource: "*"
+
+      Path: "/"
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+  InstanceProfile: 
+    Type: "AWS::IAM::InstanceProfile"
+    Condition: IsPrimaryRegion
+    Properties: 
+      Path: "/"
+      Roles: 
+        - !Ref InstanceIAMRole
+  #AuroraKMSCMK:
+  #  Type: 'AWS::KMS::Key'
+  #  Condition: IsPrimaryRegion
+  #  DeletionPolicy: Delete
+  #  Properties:
+  #    KeyPolicy:
+  #      Version: '2012-10-17'
+  #      Statement:
+  #      - Effect: Allow
+  #        Principal:
+  #          AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+  #        Action: 'kms:*'
+  #        Resource: '*'
+  #      - Effect: Allow
+  #        Principal:
+  #          AWS: '*'
+  #        Action:
+  #        - 'kms:Encrypt'
+  #        - 'kms:Decrypt'
+  #        - 'kms:ReEncrypt*'
+  #        - 'kms:GenerateDataKey*'
+  #        - 'kms:CreateGrant'
+  #        - 'kms:ListGrants'
+  #        - 'kms:DescribeKey'
+  #        Resource: '*'
+  #        Condition:
+  #          StringLike:
+  #            'kms:CallerAccount': !Ref 'AWS::AccountId'
+  #            'kms:ViaService': "rds.*.amazonaws.com"
+  #AuroraKMSCMKAlias:
+  #  Type: 'AWS::KMS::Alias'
+  #  Condition: IsPrimaryRegion
+  #  DeletionPolicy: Delete
+  #  DependsOn: RDSCluster
+  #  Properties:
+  #    AliasName: !Sub 'alias/${RDSCluster}'
+  #    TargetKeyId: !Ref AuroraKMSCMK
+  MyRDSInstanceRotationSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: GlobalDbCredentials
+      Description: Generated Admin RDS Credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+      ReplicaRegions:
+        - Region: ap-southeast-1
+  BinlogEnabledDBClusterParameterGroup:
+    Type: 'AWS::RDS::DBClusterParameterGroup'
+    Properties:
+      Description: Aurora Cluster Parameter Group with Binlog enabled
+      Family: aurora-mysql5.7
+      Parameters:
+        binlog_format: ROW
+        binlog_row_image: full
+  DBParamGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Join [ "- ", [ "Aurora DB Parameter Group for Cloudformation Stack ", !Ref "AWS::StackName" ] ]
+      Family: aurora-mysql5.7
+  RDSSubnetGroup: 
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties: 
+      DBSubnetGroupDescription: Subnet Group for Aurora
+      SubnetIds: !Ref DatabaseSubnets
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: Database Security Group
+      SecurityGroupIngress:
+        - ToPort: 3306
+          FromPort: 3306
+          IpProtocol: tcp
+          SourceSecurityGroupId: !GetAtt AppSubnetGroup.GroupId
+        - ToPort: 3306
+          FromPort: 3306
+          IpProtocol: tcp
+          CidrIp: "59.167.121.41/32"
+      Tags:
+        - Key: Name
+          Value: !Sub ${GlobalClusterIdentifier}-sg
+  GlobalCluster:
+    Type: 'AWS::RDS::GlobalCluster'
+    Condition: IsPrimaryRegion
+    Properties:
+      GlobalClusterIdentifier: !Ref GlobalClusterIdentifier
+      SourceDBClusterIdentifier: !Ref RDSCluster
+  RDSCluster:
+    Type: 'AWS::RDS::DBCluster'
+    DeletionPolicy: Delete
+    Properties:
+      DBClusterParameterGroupName: !Ref BinlogEnabledDBClusterParameterGroup
+      DatabaseName: !If [IsPrimaryRegion, GlobalDb, !Ref AWS::NoValue]
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      Engine: aurora-mysql
+      EngineVersion: 5.7.mysql_aurora.2.09.2
+      GlobalClusterIdentifier: !If [IsPrimaryRegion, !Ref AWS::NoValue, !Ref GlobalClusterIdentifier]
+      MasterUsername: !If [IsPrimaryRegion, !Sub '{{resolve:secretsmanager:${MyRDSInstanceRotationSecret}::username}}', !Ref "AWS::NoValue"]
+      MasterUserPassword: !If [IsPrimaryRegion, !Sub '{{resolve:secretsmanager:${MyRDSInstanceRotationSecret}::password}}', !Ref "AWS::NoValue"]
+      #StorageEncrypted: !If [IsPrimaryRegion, true, !Ref "AWS::NoValue"]
+      #KmsKeyId: !If [IsPrimaryRegion, !Ref AuroraKMSCMK, !Ref "AWS::NoValue"]
+      #SourceRegion: !If [IsPrimaryRegion, !Ref "AWS::NoValue", !Ref AuroraKMSCMK]
+      VpcSecurityGroupIds:
+        - !Ref DBSecurityGroup
+      Tags:
+        -
+          Key: Name
+          Value: !Join ['-',[!Ref GlobalClusterIdentifier, !Ref "AWS::Region"]]
+  RDSMasterInstance:
+    Type: 'AWS::RDS::DBInstance'
+    Condition: IsPrimaryRegion
+    DeletionPolicy: Delete
+    Properties:
+      Engine: aurora-mysql
+      DBClusterIdentifier: !Ref RDSCluster
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      DBParameterGroupName: default.aurora-mysql5.7
+      PubliclyAccessible: True
+      DBInstanceClass: db.r5.large
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt MonitoringIAMRole.Arn
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+  RDSReplicaInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: IsPrimaryRegion
+    DeletionPolicy: Delete
+    DependsOn: RDSMasterInstance
+    Properties:
+      Engine: aurora-mysql
+      DBClusterIdentifier: !Ref RDSCluster
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      DBParameterGroupName: default.aurora-mysql5.7
+      PubliclyAccessible: True
+      DBInstanceClass: db.r5.large
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt MonitoringIAMRole.Arn
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+  CPUUtilizationAlarm1:
+    Type: "AWS::CloudWatch::Alarm"
+    Condition: IsPrimaryRegion
+    Properties:
+      ActionsEnabled: true
+      AlarmActions:
+      - Ref: DBNotificationTopic
+      AlarmDescription: 'CPU_Utilization'
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value:
+          Ref: RDSMasterInstance
+      MetricName: CPUUtilization
+      Statistic: Maximum
+      Namespace: 'AWS/RDS'
+      Threshold: 80
+      Unit: Percent
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      Period: 60
+      EvaluationPeriods: 5
+      TreatMissingData: 'notBreaching'
+  CPUUtilizationAlarm2:
+    Type: "AWS::CloudWatch::Alarm"
+    Condition: IsPrimaryRegion
+    Properties:
+      ActionsEnabled: true
+      AlarmActions:
+      - Ref: DBNotificationTopic
+      AlarmDescription: 'CPU_Utilization'
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value:
+          Ref: RDSReplicaInstance
+      MetricName: CPUUtilization
+      Statistic: Maximum
+      Namespace: 'AWS/RDS'
+      Threshold: 80
+      Unit: Percent
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      Period: 60
+      EvaluationPeriods: 5
+      TreatMissingData: 'notBreaching'
+  MaxUsedTxIDsAlarm1:
+    Type: "AWS::CloudWatch::Alarm"
+    Condition: IsPrimaryRegion
+    Properties:
+      ActionsEnabled: true
+      AlarmActions:
+      - Ref: DBNotificationTopic
+      AlarmDescription: 'Maximum Used Transaction IDs'
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value:
+          Ref: RDSMasterInstance
+      MetricName: 'MaximumUsedTransactionIDs'
+      Statistic: Average
+      Namespace: 'AWS/RDS'
+      Threshold: 600000000
+      Unit: Count
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      Period: 60
+      EvaluationPeriods: 5
+      TreatMissingData: 'notBreaching'
+  MaxUsedTxIDsAlarm2:
+    Type: "AWS::CloudWatch::Alarm"
+    Condition: IsPrimaryRegion
+    Properties:
+      ActionsEnabled: true
+      AlarmActions:
+      - Ref: DBNotificationTopic
+      AlarmDescription: 'Maximum Used Transaction IDs'
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value:
+          Ref: RDSReplicaInstance
+      MetricName: 'MaximumUsedTransactionIDs'
+      Statistic: Average
+      Namespace: 'AWS/RDS'
+      Threshold: 600000000
+      Unit: Count
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold'
+      Period: 60
+      EvaluationPeriods: 5
+      TreatMissingData: 'notBreaching'
+  FreeLocalStorageAlarm1:
+    Type: "AWS::CloudWatch::Alarm"
+    Condition: IsPrimaryRegion
+    Properties:
+      ActionsEnabled: true
+      AlarmActions:
+      - Ref: DBNotificationTopic
+      AlarmDescription: 'Free Local Storage'
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value:
+          Ref: RDSMasterInstance
+      MetricName: 'FreeLocalStorage'
+      Statistic: Average
+      Namespace: 'AWS/RDS'
+      Threshold: 5368709120
+      Unit: Bytes
+      ComparisonOperator: 'LessThanOrEqualToThreshold'
+      Period: 60
+      EvaluationPeriods: 5
+      TreatMissingData: 'notBreaching'
+  FreeLocalStorageAlarm2:
+    Type: "AWS::CloudWatch::Alarm"
+    Condition: IsPrimaryRegion
+    Properties:
+      ActionsEnabled: true
+      AlarmActions:
+      - Ref: DBNotificationTopic
+      AlarmDescription: 'Free Local Storage'
+      Dimensions:
+      - Name: DBInstanceIdentifier
+        Value:
+          Ref: RDSReplicaInstance
+      MetricName: 'FreeLocalStorage'
+      Statistic: Average
+      Namespace: 'AWS/RDS'
+      Threshold: 5368709120
+      Unit: Bytes
+      ComparisonOperator: 'LessThanOrEqualToThreshold'
+      Period: 60
+      EvaluationPeriods: 5
+      TreatMissingData: 'notBreaching'  
+  DatabaseClusterEventSubscription:
+    Type: 'AWS::RDS::EventSubscription'
+    Properties:
+      EventCategories:
+      - failover
+      - failure
+      - notification
+      SnsTopicArn: !Ref DBNotificationTopic
+      SourceIds: [!Ref RDSCluster]
+      SourceType: 'db-cluster'
+  DatabaseInstanceEventSubscription:
+    Type: 'AWS::RDS::EventSubscription'
+    Condition: IsPrimaryRegion
+    Properties:
+      EventCategories:
+      - availability
+      - configuration change
+      - deletion
+      - failover
+      - failure
+      - maintenance
+      - notification
+      - read replica
+      - recovery
+      - restoration
+      SnsTopicArn: !Ref DBNotificationTopic
+      SourceIds: 
+      - !Ref RDSMasterInstance
+      - !Ref RDSReplicaInstance
+      SourceType: 'db-instance'
+  DBParameterGroupEventSubscription:
+    Type: 'AWS::RDS::EventSubscription'
+    Properties:
+      EventCategories:
+      - configuration change
+      SnsTopicArn: !Ref DBNotificationTopic
+      SourceIds: [!Ref DBParamGroup]
+      SourceType: 'db-parameter-group'
+  ReaderEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Condition: IsPrimaryRegion
+    Properties:
+      Description: Cluster Reader Endpoint for the Global cluster in this region.
+      Name: global-db-reader-endpoint
+      Type: String
+      Value: !GetAtt RDSCluster.ReadEndpoint.Address
+      Tier: Standard
+  WriterEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Condition: IsPrimaryRegion
+    Properties:
+      Description: Cluster Writer Endpoint for the Global cluster in this region.
+      Name: global-db-writer-endpoint
+      Type: String
+      Value: !GetAtt RDSCluster.Endpoint.Address
+      Tier: Standard
+  MyEC2Instance:
+    Type: AWS::EC2::Instance
+    Condition: IsPrimaryRegion
+    DependsOn:
+      - ReaderEndpointParameter
+      - WriterEndpointParameter
+    Properties: 
+      ImageId: !Ref InstanceAmiId
+      InstanceType: t3.micro
+      SecurityGroupIds:
+        - !Ref AppSubnetGroup
+      SubnetId: !Ref InstanceSubnet
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData: 
+        Fn::Base64: !Sub | 
+          #!/bin/bash -xe
+          sudo amazon-linux-extras enable corretto8
+          sudo yum install -y java-1.8.0-amazon-corretto amazon-cloudwatch-agent
+          mkdir ~/global-db
+          cd ~/global-db
+          wget https://github.com/aws-observability/aws-otel-java-instrumentation/releases/latest/download/aws-opentelemetry-agent.jar
+          aws s3 sync s3://globaldb-demo-assets . --region ap-southeast-2
+          chmod 700 *
+          sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/home/ssm-user/global-db/cloudwatch_agent_config.json -o default
+Outputs:
+  ReaderEndpoint:
+    Condition: IsPrimaryRegion
+    Description: Cluster Reader Endpoint for the Global cluster in this region
+    Value: !GetAtt RDSCluster.ReadEndpoint.Address
+  WriterEndpoint:
+    Condition: IsPrimaryRegion
+    Description: Cluster Writer Endpoint for the Global cluster in this region
+    Value: !GetAtt RDSCluster.Endpoint.Address
